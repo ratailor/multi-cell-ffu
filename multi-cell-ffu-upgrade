@@ -1,0 +1,364 @@
+#!/bin/bash                                                                                                                                        
+# cannot use unset
+
+if [ "$#" -ne 1 ]; then
+echo "Pass host as aparamter" 2>&1
+echo "./$0 haa-09.ha.lab.eng.bos.redhat.com" 2>&1
+exit 1
+fi
+
+HOST=$1
+DATE=$(date +%Y%m%d-%H%M)
+ROOTDIR="$HOME/ospdeploy/ci/infrared/"
+BASEDIR="$ROOTDIR/run/$HOST"
+VENVDIR="$BASEDIR/venv"
+LOGFILE="$BASEDIR/run.log"
+SSH="ssh -t -F $BASEDIR/ssh.config.ansible undercloud"
+SCP="scp -F $BASEDIR/ssh.config.ansible"
+IR_TRIPLEO_OVERCLOUD_STACK_NAME=overcloud
+
+rm -rf $BASEDIR
+mkdir -p $BASEDIR
+cd $BASEDIR
+git clone https://github.com/redhat-openstack/infrared.git
+virtualenv --python=/usr/bin/python3.6 $VENVDIR
+#virtualenv $VENVDIR
+# Enter the venv
+source $VENVDIR/bin/activate
+pip install --upgrade pip
+pip install --upgrade setuptools
+cd $BASEDIR/infrared
+pip install .  2>&1 | tee $LOGFILE
+echo "virtual env complete"
+TOPOLOGY_NODES=undercloud:1,controller:3,compute:4,freeipa:1
+TOPOLOGY_NET=3_nets
+
+IMG_URL=http://rhos-qe-mirror-rdu2.usersys.redhat.com/rhel-8/rel-eng/RHEL-8/latest-RHEL-8.4.0/compose/BaseOS/x86_64/images/rhel-guest-image-8.4-992.x86_64.qcow2
+MIRROR=rdu2
+SSHKEY=~/.ssh/id_rsa
+VERSION=16.2
+#BUILD=RHOS-16.2-RHEL-8-20220902.n.1
+#BUILD=RHOS-16.2-RHEL-8-20221201.n.1
+BUILD=RHOS-16.2-RHEL-8-20230209.n.1
+
+infrared plugin remove tripleo-upgrade
+infrared plugin add --revision stable/wallaby tripleo-upgrade
+
+
+# use mv instead of symbolic link to avoid too many levels of symbolic links issue
+mkdir -p $HOME/.infrared/plugins/tripleo-upgrade/infrared_plugin/roles/tripleo-upgrade
+find $HOME/.infrared/plugins/tripleo-upgrade -maxdepth 1 -mindepth 1 -not -name infrared_plugin                     -exec mv '{}' $HOME/.infrared/plugins/tripleo-upgrade/infrared_plugin/roles/tripleo-upgrade \;
+
+if [ ! -f workarounds.yaml ]; then
+    curl -sSko workarounds.yaml https://gitlab.cee.redhat.com/rhos-upgrades/workarounds/-/raw/master/upgrade/16.2-17.1_upgrade_workarounds.yaml
+fi
+
+
+sed -i -E 's|(.*rhos-release 16.2.*)-p [A-Za-z0-9_.-]+|\1-p passed_phase2|' workarounds.yaml
+
+
+sed -i -E 's|(.*rhos-release 17.1.*)-p [A-Za-z0-9_.-]+|\1-p passed_phase1|' workarounds.yaml
+
+
+sed -i -E 's|(.*rhos-release 17.1.*)-r [0-9.]+|\1-r 8.4|' workarounds.yaml
+
+echo "before vm cleanup"
+# cleanup previous vms
+function cleanup_host() {
+infrared virsh --host-address ${HOST} \
+--host-key ${SSHKEY} \
+-o cleanup.yml \
+--cleanup yes
+}
+
+echo "vm cleaned"
+
+# [provision new vms - same command without '--cleanup']
+function create_vms() {
+infrared virsh --host-address ${HOST} \
+--host-key ${SSHKEY} \
+--host-memory-overcommit False \
+--topology-nodes ${TOPOLOGY_NODES} \
+--topology-network ${TOPOLOGY_NET} \
+--output provision.yml \
+--image-url ${IMG_URL} \
+--serial-files true \
+--collect-ansible-facts False \
+-e override.undercloud.disks.disk1.size=100G \
+-e override.undercloud.memory=24576 \
+-e override.controller.cpu=4 \
+-e override.controller.memory=20480 \
+-e override.compute.cpu=2 \
+-e override.compute.memory=8192 \
+-e override.ceph.cpu=2 \
+-e override.ceph.memory=8192 \
+-e override.networker.cpu=2 \
+-e override.networker.memory=8192 \
+-e override.database.cpu=2 \
+-e override.database.memory=8192 \
+-e override.messaging.cpu=2 \
+-e override.messaging.memory=8192
+}
+
+
+function vms_create() {
+infrared virsh -o provision.yml \
+--topology-nodes ${TOPOLOGY_NODES} \
+--topology-network ${TOPOLOGY_NET} \
+--host-address ${HOST} \
+--host-key ${SSHKEY} \
+--image-url ${IMG_URL} \
+--host-memory-overcommit False \
+--serial-files true \
+--collect-ansible-facts False \
+-e override.undercloud.memory=32768 \
+-e override.undercloud.cpu=8 \
+-e override.undercloud.swap=0 \
+-e override.undercloud.disks.disk1.size="100G" \
+-e override.controller.memory=32768 \
+-e override.controller.cpu=8 \
+-e override.controller.disks.disk1.size="50G" \
+-e override.compute.memory=12288 \
+-e override.compute.cpu=4
+}
+
+#[Install UC]
+function undercloud_install() {
+infrared tripleo-undercloud \
+--version $VERSION \
+--mirror ${MIRROR} \
+--images-task rpm \
+--images-update yes \
+--splitstack no \
+--shade-host undercloud-0 \
+--ssl yes \
+--config-options DEFAULT.undercloud_timezone=UTC \
+--ntp-pool clock.corp.redhat.com \
+--tls-everywhere yes \
+--tls-ca https://password.corp.redhat.com/RH-IT-Root-CA.crt \
+--images-packages vim,bash-completion,wget,deltarpm,strace \
+--images-cleanup True \
+--build ${BUILD} \
+--output uc_install.yml $1
+}
+
+function install_undercloud() {
+infrared tripleo-undercloud -o undercloud_settings.yml \
+--mirror ${MIRROR} \
+--version ${VERSION} \
+--build ${BUILD} \
+--splitstack no \
+--shade-host undercloud-0 \
+--ssl yes \
+--config-options DEFAULT.undercloud_timezone=UTC \
+--ntp-pool clock.corp.redhat.com \
+--tls-everywhere yes \
+--tls-ca https://password.corp.redhat.com/RH-IT-Root-CA.crt
+
+export WEBSOCKET_CLIENT_CA_BUNDLE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+infrared tripleo-undercloud -o images_settings.yml \
+--mirror ${MIRROR} \
+--images-task rpm \
+--build ${BUILD} \
+--images-update no
+}
+
+#[install OC]
+function overcloud_deploy() {
+infrared tripleo-overcloud -v \
+--introspect yes \
+--tagging no \
+--deploy no \
+--output overcloud-install.yml \
+--version ${VERSION} \
+--network-protocol ipv4 \
+--network-backend vxlan \
+--deployment-files virt \
+--build ${BUILD} \
+--collect-ansible-facts False
+}
+
+
+function deploy_overcloud() {
+infrared tripleo-overcloud -o overcloud-introspect.yml \
+--version ${VERSION} \
+--deployment-files virt \
+--introspect yes \
+--vbmc-force false \
+--vbmc-host undercloud \
+--tagging no \
+--deploy no
+
+infrared tripleo-overcloud -o overcloud-tagging.yml \
+--deployment-files virt \
+--version ${VERSION} \
+--introspect no \
+--tagging yes \
+--deploy no
+
+infrared tripleo-overcloud -o overcloud-deploy.yml \
+--version ${VERSION} \
+--containers yes \
+--deployment-files virt \
+--overcloud-debug yes \
+--overcloud-fencing no \
+--network-backend geneve \
+--network-bgpvpn no \
+--network-protocol ipv4 \
+--network-ovn true \
+--network-l2gw no \
+--network-ovs false \
+--storage-backend lvm \
+--storage-external no \
+--overcloud-ssl no \
+--splitstack no \
+--tht-roles yes \
+--tls-everywhere yes \
+--network-dvr True \
+--overcloud-templates set-nova-scheduler-filter \
+--network-lbaas false \
+--vbmc-force false \
+--introspect no \
+--tagging no \
+--deploy yes \
+--collect-ansible-facts False \
+--ntp-pool clock.corp.redhat.com \
+--config-heat ComputeExtraConfig.nova::compute::allow_resize_to_same_host='True' \
+--config-heat ControllerExtraConfig.nova::api::allow_resize_to_same_host='True' \
+--config-heat ControllerExtraConfig.cinder::allow_availability_zone_fallback='True' \
+--config-heat ValidateGatewaysIcmp='false' \
+--compute-nodes 1
+}
+
+function cloud_config() {
+
+if [ -z "$(infrared plugin list | grep tripleo-config-changes)" ]; then
+    infrared plugin add https://github.com/rhos-infra/tripleo-config-changes 
+fi
+
+infrared tripleo-config-changes \
+--add-additional-cell yes \
+--openstack-version 16.2
+
+if [[ '--tasks create_external_network,forward_overcloud_dashboard,network_time,tempest_deployer_input' == *"create_external_network"* ]]; then
+    export EXTERNAL_NETWORK=" --deployment-files virt \
+    --public-subnet default_subnet \
+    --network-protocol ipv4"
+fi
+
+infrared cloud-config -o cloud-config.yml \
+--tasks create_external_network,forward_overcloud_dashboard,network_time,tempest_deployer_input \
+--version 16.2 \
+$EXTERNAL_NETWORK
+}
+
+function add_cell() {
+if [ -z "$(infrared plugin list | grep tripleo-config-changes)" ]; then
+    infrared plugin add https://github.com/rhos-infra/tripleo-config-changes
+fi
+
+infrared tripleo-config-changes \
+--add-additional-cell yes \
+--openstack-version 16.2
+}
+
+function ffu_upgrade() { 
+infrared tripleo-undercloud -o undercloud-upgrade.yml \
+--upgrade yes \
+--mirror ${MIRROR} \
+--build passed_phase1 \
+--version 17.1 \
+--ansible-args="tags=discover_python,upgrade_repos,undercloud_version_discovery,undercloud_containers,export"
+
+infrared ssh `infrared workspace node-list -g undercloud -f json | jq -r .nodes[].name`
+"source stackrc && \
+sudo dnf -y update openstack-tripleo-validations python3-validations-libs validations-common && \
+sudo chown stack:stack /var/lib/mistral/.ssh/tripleo-admin-rsa && \
+sudo cat /var/lib/mistral/overcloud/tripleo-ansible-inventory.yaml > inventory.yaml && \
+validation run -i inventory.yaml --group pre-upgrade "
+
+infrared tripleo-upgrade --undercloud-ffu-upgrade yes \
+--undercloud-ffu-releases '16.2-17.1' \
+--overcloud-stack overcloud \
+--upgrade-ffu-workarounds true \
+-e @workarounds.yaml
+
+infrared tripleo-upgrade --deployment-files composable_roles \
+--overcloud-ffu-upgrades yes \
+--overcloud-ffu-releases '16.2-17.1' \
+--upgrade-floating-check yes \
+--upgrade-workload yes \
+--overcloud-stack overcloud \
+--upgrade-ffu-workarounds yes \
+-e @workarounds.yaml \
+--upgrade-workloadcleanup yes \
+-e upgrade_prepare_extra_params="/home/stack/overcloud-params.yaml,/home/stack/overcloud-deploy/overcloud/overcloud-network-environment.yaml,/home/stack/tmp/baremetal_deployment.yaml,/home/stack/tmp/generated-networks-deployed.yaml,/home/stack/tmp/generated-vip-deployed.yaml" \
+--overcloud-ssh-user heat-admin \
+--ansible-args="skip-tags=create_ffu_scripts,ffu_overcloud_run,ffu_overcloud_upgrade_role,ffu_overcloud_converge,ffu_overcloud_post"
+
+infrared tripleo-upgrade --deployment-files composable_roles \
+--overcloud-ffu-upgrades yes \
+--overcloud-ffu-releases '16.2-17.1' \
+--upgrade-floating-check yes \
+--upgrade-workload yes \
+--overcloud-stack cell1 \
+--upgrade-ffu-workarounds yes \
+-e @workarounds.yaml \
+--upgrade-workloadcleanup yes \
+-e upgrade_prepare_extra_params="/home/stack/overcloud-params.yaml,/home/stack/overcloud-deploy/overcloud/overcloud-network-environment.yaml,/home/stack/tmp/baremetal_deployment.yaml,/home/stack/tmp/generated-networks-deployed.yaml,/home/stack/tmp/generated-vip-deployed.yaml" \
+--overcloud-ssh-user heat-admin \
+--ansible-args="skip-tags=create_ffu_scripts,ffu_overcloud_run,ffu_overcloud_upgrade_role,ffu_overcloud_converge,ffu_overcloud_post"
+
+infrared tripleo-upgrade --deployment-files composable-roles \
+--overcloud-ffu-upgrade yes \
+--overcloud-ffu-releases '16.2,-,17.1' \
+--upgrade-floatingip-check yes \
+--upgrade-workload yes \
+--overcloud-stack overcloud \
+--upgrade-ffu-workarounds yes \
+-e @workarounds.yaml \
+--upgrade-workloadcleanup yes \
+-e upgrade_prepare_extra_params="/home/stack/overcloud-params.yaml,/home/stack/overcloud-deploy/overcloud/overcloud-network-environment.yaml,/home/stack/tmp/baremetal_deployment.yaml,/home/stack/tmp/generated-networks-deployed.yaml,/home/stack/tmp/generated-vip-deployed.yaml" \
+--overcloud-ssh-user heat-admin \
+--upgrade-workloadcleanup yes \
+-e upgrade_prepare_extra_params="/home/stack/overcloud-params.yaml,/home/stack/overcloud-deploy/overcloud/overcloud-network-environment.yaml,/home/stack/tmp/baremetal_deployment.yaml,/home/stack/tmp/generated-networks-deployed.yaml,/home/stack/tmp/generated-vip-deployed.yaml,/usr/share/openstack-tripleo-heat-templates/environments/nova-hw-machine-type-upgrade.yaml" \
+--ansible-args="skip-tags=create_ffu_scripts,ffu_overcloud_prepare,ffu_overcloud_run,ffu_overcloud_upgrade_role,ffu_overcloud_converge,ffu_overcloud_post"
+
+infrared ssh undercloud-0 'sh overcloud_upgrade_prepare.sh'
+
+infrared tripleo-upgrade --deployment-files composable_roles \
+--overcloud-ffu-upgrade yes \
+--overcloud-ffu-releases '16.2,-,17.1' \
+--upgrade-floatingip-check yes \
+--upgrade-workload yes \
+--overcloud-stack overcloud \
+--upgrade-ffu-workarounds yes \
+-e @workarounds.yaml \
+--upgrade-workloadcleanup yes \
+-e upgrade_prepare_extra_params="/home/stack/overcloud-params.yaml,/home/stack/overcloud-deploy/${IR_TRIPLEO_OVERCLOUD_STACK_NAME}/${IR_TRIPLEO_OVERCLOUD_STACK_NAME}-network-environment.yaml,/home/stack/tmp/baremetal_deployment.yaml,/home/stack/tmp/generated-networks-deployed.yaml,/home/stack/tmp/generated-vip-deployed.yaml,/usr/share/openstack-tripleo-heat-templates/environments/nova-hw-machine-type-upgrade.yaml" \
+-e tripleo_upgrade_debug=True \
+--fast-and-furious true \
+--ansible-args="skip-tags=create_ffu_scripts,ffu_overcloud_prepare,ffu_overcloud_upgrade_compute,ffu_overcloud_converge,ffu_overcloud_post,ffu_overcloud_system_upgrade"
+}
+
+
+echo "calling cleanup "
+cleanup_host
+#create_vms
+vms_create
+echo "vms created"
+echo "Using ssh conf: $SSHCONF"
+#undercloud_install
+install_undercloud
+echo "undercloud installed"
+#overcloud_deploy
+deploy_overcloud
+echo "overcloud deployed"
+#cloud_config
+#echo "cloud config done"
+add_cell
+echo "additional cell added"
+ffu_upgrade
+echo "ffu upgraded"
+exit 0
